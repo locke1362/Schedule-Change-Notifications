@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Connect schedule notifications. An EventBridge rule captures Connect
+  "Scheduling Rules Matched" events and invokes a Lambda that calls the Connect
+  CreateNotification API to notify the affected agent(s). Self-contained: the
+  Lambda code is inline, so this template deploys directly with no build/package
+  step and no S3 bucket.
+
+Parameters:
+  ConnectInstanceId:
+    Type: String
+    Description: >
+      Your Amazon Connect instance ID (the GUID only, NOT the full ARN).
+      Found in the Amazon Connect console or after "instance/" in the instance ARN.
+    AllowedPattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    ConstraintDescription: Must be a valid Amazon Connect instance ID (a GUID), e.g. 11111111-2222-3333-4444-555555555555
+  NotificationRecipientArns:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated list of recipient ARNs (Connect user ARNs or the instance ARN)
+      used as a fallback when the triggering event contains no agent-specific recipient.
+      Example: arn:aws:connect:us-west-2:111122223333:instance/<instance-id>/agent/<agent-id>
+
+Resources:
+  ScheduleNotificationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: schedule-notification-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/connect-schedule-notification-handler:*"
+              - Effect: Allow
+                Action:
+                  - connect:CreateNotification
+                Resource:
+                  - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}"
+                  - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/*"
+
+  ScheduleNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: connect-schedule-notification-handler
+      Handler: index.lambda_handler
+      Runtime: python3.13
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt ScheduleNotificationFunctionRole.Arn
+      Environment:
+        Variables:
+          CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
+          NOTIFICATION_RECIPIENT_ARNS: !Join [",", !Ref NotificationRecipientArns]
+      Code:
+        ZipFile: |
+          """Lambda handler for Amazon Connect scheduling notification events.
+
+          Triggered by EventBridge on a Connect "Scheduling Rules Matched" event.
+          Calls the Connect CreateNotification API to notify the affected agent(s).
+          """
+          import json
+          import os
+          import logging
+          import uuid
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          connect_client = boto3.client("connect")
+
+          INSTANCE_ID = os.environ["CONNECT_INSTANCE_ID"]
+          FALLBACK_RECIPIENT_ARNS = [
+              arn.strip()
+              for arn in os.environ.get("NOTIFICATION_RECIPIENT_ARNS", "").split(",")
+              if arn.strip()
+          ]
+
+
+          def get_affected_recipients(event):
+              """Agent ARN(s) live in the top-level 'resources' array and contain '/agent/'."""
+              resources = event.get("resources", [])
+              agent_arns = [r for r in resources if "/agent/" in r]
+              if agent_arns:
+                  return agent_arns
+              logger.warning("No agent-specific recipients in event; using fallback recipients")
+              return FALLBACK_RECIPIENT_ARNS
+
+
+          def build_notification_message(detail):
+              rule_name = detail.get("ruleName", "")
+              if rule_name:
+                  return (
+                      f"Your schedule has been updated (rule: {rule_name}). "
+                      "Please check your schedule in Amazon Connect."
+                  )
+              return "A schedule change has occurred. Please check your schedule in Amazon Connect."
+
+
+          def lambda_handler(event, context):
+              logger.info("Received event: %s", json.dumps(event))
+
+              detail = event.get("detail", {})
+              message = build_notification_message(detail)
+              recipients = get_affected_recipients(event)
+
+              if not recipients:
+                  logger.error("No recipients found - cannot send notification")
+                  return {"statusCode": 400, "body": json.dumps({"error": "No recipients available"})}
+
+              logger.info("Sending notification: recipients=%s, message=%s", recipients, message)
+
+              try:
+                  response = connect_client.create_notification(
+                      InstanceId=INSTANCE_ID,
+                      Recipients=recipients,
+                      Priority="HIGH",
+                      Content={"en_US": message},
+                      ClientToken=str(uuid.uuid4()),
+                  )
+                  notification_id = response.get("NotificationId")
+                  logger.info("Notification created successfully: %s", notification_id)
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps(
+                          {
+                              "message": "Notification sent successfully",
+                              "notificationId": notification_id,
+                              "recipients": recipients,
+                          }
+                      ),
+                  }
+              except connect_client.exceptions.ResourceNotFoundException as e:
+                  logger.error("Connect instance or resource not found: %s", str(e))
+                  raise
+              except connect_client.exceptions.InvalidParameterException as e:
+                  logger.error("Invalid parameter in CreateNotification call: %s", str(e))
+                  raise
+              except Exception as e:
+                  logger.error("Unexpected error creating notification: %s", str(e))
+                  raise
+
+  ScheduleNotificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/connect-schedule-notification-handler
+      RetentionInDays: 14
+
+  SchedulingRulesMatchedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: connect-scheduling-rules-matched
+      Description: Capture Amazon Connect "Scheduling Rules Matched" events.
+      EventPattern:
+        source:
+          - aws.connect
+        detail-type:
+          - "Scheduling Rules Matched"
+      State: ENABLED
+      Targets:
+        - Id: ScheduleNotificationFunction
+          Arn: !GetAtt ScheduleNotificationFunction.Arn
+
+  ScheduleNotificationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScheduleNotificationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SchedulingRulesMatchedRule.Arn
+
+Outputs:
+  FunctionArn:
+    Description: ARN of the schedule notification Lambda function
+    Value: !GetAtt ScheduleNotificationFunction.Arn
+  EventRuleArn:
+    Description: ARN of the EventBridge rule
+    Value: !GetAtt SchedulingRulesMatchedRule.Arn
