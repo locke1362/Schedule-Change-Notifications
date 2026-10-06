@@ -1,10 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Amazon Connect schedule notifications. An EventBridge rule captures Connect
-  "Scheduling Rules Matched" events and invokes a Lambda that calls the Connect
-  CreateNotification API to notify the affected agent(s). Self-contained: the
-  Lambda code is inline, so this template deploys directly with no build/package
-  step and no S3 bucket.
+  Amazon Connect schedule notifications. Creates (1) the Amazon Connect Rules-engine
+  rule for "Published schedule is updated" that generates an EventBridge event for the
+  targeted agents, (2) an EventBridge rule that captures that event, and (3) a Lambda
+  that calls the Connect CreateNotification API to notify the affected agent(s).
+  Self-contained: all Lambda code is inline, so this template deploys directly with no
+  build/package step and no S3 bucket.
 
 Parameters:
   ConnectInstanceId:
@@ -14,14 +15,37 @@ Parameters:
       Found in the Amazon Connect console or after "instance/" in the instance ARN.
     AllowedPattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
     ConstraintDescription: Must be a valid Amazon Connect instance ID (a GUID), e.g. 11111111-2222-3333-4444-555555555555
+  TargetAgentIds:
+    Type: CommaDelimitedList
+    Description: >
+      REQUIRED. Comma-separated agents to target in the Connect rule (at least one). Each
+      entry may be an agent user ID (GUID) or a full agent ARN; the agent ID is extracted
+      automatically. Amazon Connect requires a scheduling rule to specify at least one
+      schedule resource condition, so this cannot be empty.
   NotificationRecipientArns:
     Type: CommaDelimitedList
     Description: >
       Comma-separated list of recipient ARNs (Connect user ARNs or the instance ARN)
-      used as a fallback when the triggering event contains no agent-specific recipient.
+      used by the notification Lambda as a fallback when the triggering event contains
+      no agent-specific recipient.
       Example: arn:aws:connect:us-west-2:111122223333:instance/<instance-id>/agent/<agent-id>
+  ConnectRuleName:
+    Type: String
+    Default: Schedule-Update-Notification
+    Description: Name of the Amazon Connect rule to create (allowed chars 0-9 a-z A-Z . _ -).
+    AllowedPattern: "^[0-9a-zA-Z._-]+$"
+  EventBridgeActionName:
+    Type: String
+    Default: Schedule-Update-Notification
+    Description: >
+      The action name Connect stamps into the emitted event as detail.actionName.
+      Arbitrary label; does not reference an AWS EventBridge rule.
+    AllowedPattern: "^[0-9a-zA-Z._-]+$"
 
 Resources:
+  # ---------------------------------------------------------------------------
+  # Notification Lambda: reacts to the EventBridge event and calls CreateNotification
+  # ---------------------------------------------------------------------------
   ScheduleNotificationFunctionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -67,8 +91,8 @@ Resources:
         ZipFile: |
           """Lambda handler for Amazon Connect scheduling notification events.
 
-          Triggered by EventBridge on a Connect "Scheduling Rules Matched" event.
-          Calls the Connect CreateNotification API to notify the affected agent(s).
+          Triggered by EventBridge on a Connect scheduling rule event. Calls the
+          Connect CreateNotification API to notify the affected agent(s).
           """
           import json
           import os
@@ -163,7 +187,7 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: connect-scheduling-rules-matched
-      Description: Capture Amazon Connect "Scheduling Rules Matched" events.
+      Description: Capture the Amazon Connect scheduling rule event.
       EventPattern:
         source:
           - aws.connect
@@ -182,6 +206,183 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt SchedulingRulesMatchedRule.Arn
 
+  # ---------------------------------------------------------------------------
+  # Custom resource: creates/updates/deletes the Amazon Connect Rules-engine rule
+  # ---------------------------------------------------------------------------
+  ConnectRuleManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: connect-rule-manager-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/connect-schedule-rule-manager:*"
+              - Effect: Allow
+                Action:
+                  - connect:CreateRule
+                  - connect:UpdateRule
+                  - connect:DeleteRule
+                  - connect:DescribeRule
+                  - connect:ListRules
+                Resource:
+                  - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}"
+                  - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/*"
+
+  ConnectRuleManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: connect-schedule-rule-manager
+      Handler: index.lambda_handler
+      Runtime: python3.13
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt ConnectRuleManagerRole.Arn
+      Code:
+        ZipFile: |
+          """CFN custom resource: manage the Connect OnScheduleUpdate rule (create/update/delete)."""
+          import json
+          import logging
+
+          import boto3
+          import cfnresponse
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+          connect = boto3.client("connect")
+
+          EVENT_SOURCE = "OnScheduleUpdate"
+
+
+          def agent_ids(props):
+              raw = props.get("TargetAgentIds", [])
+              if isinstance(raw, str):
+                  raw = raw.split(",")
+              out = []
+              for e in raw:
+                  e = (e or "").strip()
+                  if not e:
+                      continue
+                  if "/agent/" in e:
+                      out.append(e.split("/agent/", 1)[1])
+                  elif ":" not in e and "/" not in e:
+                      out.append(e)
+                  else:
+                      log.warning("Ignoring non-agent target: %s", e)
+              seen = set()
+              return [a for a in out if not (a in seen or seen.add(a))]
+
+
+          def build_function(ids):
+              return json.dumps({
+                  "Version": "2022-11-25",
+                  "RuleFunction": {
+                      "Operator": "AND",
+                      "Operands": [{
+                          "Operator": "CONTAINS_ANY",
+                          "ComparisonValue": "$.Scheduling.ImpactedAgents[*].Id",
+                          "Operands": ids,
+                          "Negate": False,
+                      }],
+                  },
+              })
+
+
+          def find_rule_id(instance_id, name):
+              paginator = connect.get_paginator("list_rules")
+              for page in paginator.paginate(InstanceId=instance_id, EventSourceName=EVENT_SOURCE):
+                  for s in page.get("RuleSummaryList", []):
+                      if s.get("Name") == name:
+                          return s.get("RuleId")
+              return None
+
+
+          def create_or_update(props):
+              instance_id = props["ConnectInstanceId"]
+              name = props["RuleName"]
+              ids = agent_ids(props)
+              if not ids:
+                  raise ValueError("TargetAgentIds is empty; a Connect scheduling rule requires at least one agent to target.")
+              log.info("Rule %s targeting %d agent(s)", name, len(ids))
+              function = build_function(ids)
+              actions = [{
+                  "ActionType": "GENERATE_EVENTBRIDGE_EVENT",
+                  "EventBridgeAction": {"Name": props["EventBridgeActionName"]},
+              }]
+              existing = find_rule_id(instance_id, name)
+              if existing:
+                  log.info("Updating rule %s (%s)", name, existing)
+                  connect.update_rule(RuleId=existing, InstanceId=instance_id, Name=name,
+                                      Function=function, Actions=actions, PublishStatus="PUBLISHED")
+                  return existing
+              log.info("Creating rule %s", name)
+              resp = connect.create_rule(InstanceId=instance_id, Name=name,
+                                         TriggerEventSource={"EventSourceName": EVENT_SOURCE},
+                                         Function=function, Actions=actions, PublishStatus="PUBLISHED")
+              return resp["RuleId"]
+
+
+          def delete(props, physical_id):
+              instance_id = props["ConnectInstanceId"]
+              rid = physical_id if (physical_id and len(physical_id) == 36) else find_rule_id(
+                  instance_id, props["RuleName"])
+              if not rid:
+                  log.info("No rule to delete; skipping")
+                  return
+              log.info("Deleting rule %s", rid)
+              connect.delete_rule(InstanceId=instance_id, RuleId=rid)
+
+
+          def lambda_handler(event, context):
+              log.info("Event: %s", json.dumps(event))
+              rt = event["RequestType"]
+              props = event.get("ResourceProperties", {})
+              pid = event.get("PhysicalResourceId")
+              try:
+                  if rt in ("Create", "Update"):
+                      rid = create_or_update(props)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"RuleId": rid}, rid)
+                  elif rt == "Delete":
+                      delete(props, pid)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, pid)
+                  else:
+                      raise ValueError("Unknown request type: " + rt)
+              except Exception as e:
+                  log.exception("Custom resource failed")
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                   {"Error": "%s: %s" % (type(e).__name__, e)}, pid)
+
+  ConnectRuleManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/connect-schedule-rule-manager
+      RetentionInDays: 14
+
+  ConnectScheduleRule:
+    Type: AWS::CloudFormation::CustomResource
+    # Ensure the EventBridge rule exists before the Connect rule points at it.
+    DependsOn:
+      - SchedulingRulesMatchedRule
+      - ScheduleNotificationInvokePermission
+    Properties:
+      ServiceToken: !GetAtt ConnectRuleManagerFunction.Arn
+      ConnectInstanceId: !Ref ConnectInstanceId
+      RuleName: !Ref ConnectRuleName
+      EventBridgeActionName: !Ref EventBridgeActionName
+      TargetAgentIds: !Join [",", !Ref TargetAgentIds]
+
 Outputs:
   FunctionArn:
     Description: ARN of the schedule notification Lambda function
@@ -189,3 +390,6 @@ Outputs:
   EventRuleArn:
     Description: ARN of the EventBridge rule
     Value: !GetAtt SchedulingRulesMatchedRule.Arn
+  ConnectRuleId:
+    Description: ID of the Amazon Connect scheduling rule created by this stack
+    Value: !GetAtt ConnectScheduleRule.RuleId
